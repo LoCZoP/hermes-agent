@@ -5431,6 +5431,15 @@ def _get_cached_client(
         provider, model, async_mode, explicit_base_url=base_url, explicit_api_key=effective_api_key,
         api_mode=api_mode, main_runtime=runtime, is_vision=is_vision, task=task,
     )
+    if isinstance(client, _AuxProbeClientStub):
+        # Availability probe mode (check_fns): the builder returned a stub instead of a
+        # real client. Never cache it — the next real call with this cache key would be
+        # served the stub and crash on .chat (a probe at session start poisoned the cache
+        # for the whole process). Return (None, None) so callers resolve a fresh real
+        # client; the probe caller still sees "resolvable" from its own resolution.
+        logger.debug(
+            "_get_cached_client: probe-mode stub for provider=%r — not cached", provider)
+        return None, model or default_model
     if client is not None:
         with _client_cache_lock:
             if cache_key not in _client_cache:
