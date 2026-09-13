@@ -17,6 +17,7 @@ import logging
 import os
 import re
 import threading
+import time
 import uuid
 from typing import Any, Callable, Dict, Optional
 from urllib.parse import SplitResult, urlsplit, urlunsplit
@@ -214,6 +215,35 @@ def _rewrite_loopback_url_for_camofox(url: str) -> tuple[str, Optional[Dict[str,
 _sessions: Dict[str, Dict[str, Any]] = {}  # task_id -> {"user_id": str, "tab_id": str|None, ...}
 _sessions_lock = threading.Lock()
 
+# The camofox server GCs tabs and sessions on inactivity (and can restart the browser
+# child entirely), then answers with 410 Gone ("tab_destroyed", "page_crashed",
+# "tab_timeout" — all marked retryable with recovery: create_new_tab) or 404 for a
+# tab that was never known in the current browser process. Both statuses are
+# recoverable: the tab id is stale, a fresh tab is the fix. 5xx means the server
+# itself is unhappy (browser restarting, hung page) — retry after a short backoff
+# instead of failing the whole tool call.
+_GONE_STATUSES = {404, 410}
+_SERVER_ERROR_RETRYABLE_STATUSES = {500, 502, 503, 504}
+_MAX_GONE_RETRIES = 2          # recreate the tab and retry, up to this many times
+_MAX_5XX_BACKOFFS = 3         # wait-and-retry on 5xx, up to this many times
+
+
+class _CamofoxGoneError(Exception):
+    """Raised when a camofox request reports its tab/session no longer exists (404/410)."""
+
+    def __init__(self, status_code: int, payload: Any = None) -> None:
+        super().__init__(f"tab gone (HTTP {status_code})")
+        self.status_code = status_code
+        self.payload = payload if isinstance(payload, dict) else {}
+
+
+def _decode_gone_payload(response: "requests.Response") -> Any:
+    """Best-effort JSON decode of an error body (used to log the server's recovery hint)."""
+    try:
+        return response.json()
+    except Exception:
+        return {"raw": (response.text or "")[:200]}
+
 
 def _adopt_existing_tab(session: Dict[str, Any]) -> Dict[str, Any]:
     """Rehydrate tab_id from an already-open managed tab: gateway restarts empty the
@@ -286,9 +316,12 @@ def camofox_soft_cleanup(task_id: Optional[str] = None) -> bool:
 
 # ---- HTTP helpers ----
 def _request(method: str, path: str, timeout: Optional[int] = None, **kwargs: Any) -> requests.Response:
-    """Issue an authenticated request to camofox and return the raised-for-status response."""
+    """Issue an authenticated request to camofox; 404/410 become _CamofoxGoneError,
+    other 4xx/5xx stay as requests.HTTPError (raised for status)."""
     resp = getattr(requests, method)(f"{get_camofox_url()}{path}", headers=_auth_headers(),
                                      timeout=_get_command_timeout() if timeout is None else timeout, **kwargs)
+    if resp.status_code in _GONE_STATUSES:
+        raise _CamofoxGoneError(resp.status_code, _decode_gone_payload(resp))
     resp.raise_for_status()
     return resp
 
@@ -355,20 +388,42 @@ def _fetch_snapshot(session: Dict[str, Any]) -> tuple[str, int]:
 
 def _navigate_tab(task_id: Optional[str], browser_url: str) -> tuple[Dict[str, Any], dict]:
     """Open ``browser_url`` in the task's tab (creating it if missing) and return
-    ``(session, navigate_response)``. A 404 on the existing tab means the server
-    garbage-collected it — recreate instead of failing."""
+    ``(session, navigate_response)``. A 404 or 410 on the existing tab means the server
+    garbage-collected it (inactivity reaper / browser-child restart) or the page crashed
+    or timed out — the cached tab id is stale, so recreate instead of failing. (The
+    previous version only recovered on 404; the camofox server answers 410 for a tab that
+    existed but was destroyed, which left the session wedged on a dead id.)"""
     session = _get_session(task_id)
     if session["tab_id"]:
         try:
             data = _post(_tab_path(session, "navigate"), {"userId": session["user_id"], "url": browser_url}, timeout=60)
+            session["last_url"] = data.get("url") or browser_url
             return session, data
-        except requests.HTTPError as e:
-            if e.response is None or e.response.status_code != 404:
-                raise
-            logger.warning("Camofox tab %s returned 404 — tab was garbage collected. Creating a fresh tab.",
-                           session["tab_id"])
+        except _CamofoxGoneError as e:
+            logger.warning("Camofox tab %s no longer valid (HTTP %s, recovery=%s) — creating a fresh tab.",
+                           session["tab_id"], e.status_code, e.payload.get("recovery"))
             session["tab_id"] = None
-    return _ensure_tab(task_id, browser_url), {"ok": True, "url": browser_url}
+    data, _ = _ensure_tab_with_url(task_id, session, browser_url)
+    session["last_url"] = browser_url
+    return session, data
+
+
+def _ensure_tab_with_url(task_id: Optional[str], session: Dict[str, Any], url: str) -> tuple[dict, Dict[str, Any]]:
+    """Create a fresh tab at ``url`` in ``session`` and return ``(navigate_data, session)``.
+    Tolerates a browser child that is still warming up after an idle restart (retry the
+    POST /tabs on 5xx, which is the transient the server emits while relaunching)."""
+    for attempt in range(_MAX_5XX_BACKOFFS + 1):
+        try:
+            data = _post("/tabs", {"userId": session["user_id"], "listItemId": session["session_key"], "url": url}, timeout=60)
+            session["tab_id"] = data.get("tabId")
+            return data, session
+        except requests.HTTPError as e:
+            status = e.response.status_code if e.response is not None else None
+            if status is None or status not in _SERVER_ERROR_RETRYABLE_STATUSES or attempt == _MAX_5XX_BACKOFFS:
+                raise
+            # Server is probably relaunching the browser child; give it a moment and retry.
+            time.sleep(1.5 * (attempt + 1))
+    raise requests.HTTPError("Camofox tab creation failed after retries (browser may still be starting)")
 
 
 def camofox_navigate(url: str, task_id: Optional[str] = None) -> str:
@@ -429,16 +484,63 @@ def _require_tab(task_id: Optional[str], action: Optional[str] = None) -> tuple[
     return session, (_camofox_private_page_block(session, task_id, action) if action is not None else None)
 
 
-def _with_tab(task_id: Optional[str], guard_action: Optional[str], body: Callable[[Dict[str, Any]], str]) -> str:
-    """Require a tab (+ private-page guard when ``guard_action`` is set), then run ``body(session)``;
-    any exception becomes a ``tool_error``."""
+def _recover_tab(task_id: Optional[str], session: Dict[str, Any], last_url: Optional[str]) -> bool:
+    """Replace the session's (dead) tab with a fresh one after the server recycled it.
+
+    Returns ``True`` when the session is left with a usable tab (or none is required
+    because the caller will navigate explicitly). ``False`` when re-creation itself
+    failed — the caller should surface the original gone-error instead of retrying
+    against another dead id.
+    """
+    session["tab_id"] = None
+    if not last_url or last_url == "about:blank":
+        return True
     try:
-        session, blocked = _require_tab(task_id, guard_action)
-        if blocked:
-            return blocked
-        return body(session)
-    except Exception as e:
-        return tool_error(str(e), success=False)
+        _ensure_tab_with_url(task_id, session, last_url)
+        return True
+    except (requests.HTTPError, requests.ConnectionError) as exc:
+        logger.warning("Camofox tab re-creation failed (%s); the next navigate will retry.", exc)
+        return False
+
+
+def _with_tab(task_id: Optional[str], guard_action: Optional[str], body: Callable[[Dict[str, Any]], str]) -> str:
+    """Require a tab (+ private-page guard when ``guard_action`` is set), then run ``body(session)``.
+
+    Recovery (the fix for the QA "wedged on a stale tab id" wedge): the camofox server
+    recycles idle tabs/sessions and can restart its browser child between calls, after
+    which the cached tab id is dead and the server answers 410 Gone (or 404). When that
+    happens we recreate the tab on the last known URL and retry the action, up to
+    ``_MAX_GONE_RETRIES`` times; transient 5xx (browser mid-restart, hung page) gets a
+    short backoff + retry on the same tab. Any other exception becomes a ``tool_error``.
+    """
+    session, blocked = _require_tab(task_id, guard_action)
+    if blocked:
+        return blocked
+    last_url = session.get("last_url")
+    attempts = _MAX_GONE_RETRIES + 1
+    for attempt in range(attempts):
+        try:
+            return body(session)
+        except _CamofoxGoneError as e:
+            if attempt >= _MAX_GONE_RETRIES:
+                return tool_error(str(e), success=False)
+            logger.warning("Camofox tab %s gone (HTTP %s, recovery=%s); recreating and retrying (%d/%d)",
+                           session.get("tab_id"), e.status_code, e.payload.get("recovery"),
+                           attempt + 1, _MAX_GONE_RETRIES)
+            if not _recover_tab(task_id, session, last_url):
+                return tool_error(f"Camofox tab was recycled and could not be recreated ({e})", success=False)
+        except requests.HTTPError as e:
+            status = e.response.status_code if e.response is not None else None
+            if status is None or status not in _SERVER_ERROR_RETRYABLE_STATUSES:
+                return tool_error(str(e), success=False)
+            if attempt >= _MAX_GONE_RETRIES:
+                return tool_error(str(e), success=False)
+            # Transient server-side failure (browser restarting / hung page): back off, retry.
+            time.sleep(1.0 * (attempt + 1))
+        except Exception as e:
+            # Non-recoverable (network, vision LLM failure, JSON, ...): surface, don't retry.
+            return tool_error(str(e), success=False)
+    return tool_error("Camofox request failed after retries", success=False)
 
 
 def _tab_action(task_id: Optional[str], guard_action: Optional[str], suffix: str,
@@ -466,12 +568,17 @@ def camofox_click(ref: str, task_id: Optional[str] = None) -> str:
 
 def camofox_type(ref: str, text: str, task_id: Optional[str] = None) -> str:
     """Type text into an element by ref via Camofox."""
-    try:
-        session, blocked = _require_tab(task_id, "type")
-        if blocked:
-            return blocked
+    def body(session):
         clean_ref = ref.lstrip("@")
-        _post(_tab_path(session, "type"), {"userId": session["user_id"], "ref": clean_ref, "text": text})
+        try:
+            _post(_tab_path(session, "type"), {"userId": session["user_id"], "ref": clean_ref, "text": text})
+        except (_CamofoxGoneError, requests.HTTPError):
+            raise  # recoverable — let _with_tab recreate/retry
+        except Exception as e:
+            # Non-recoverable: redact the typed text from the surfaced error before it
+            # reaches tool output / chat history (matches the pre-recovery behavior).
+            from agent.display import redact_browser_typed_text_for_display
+            raise ValueError(redact_browser_typed_text_for_display(str(e), text)) from e
         from agent.display import redact_browser_typed_text_for_display, redact_tool_args_for_display
         # Match browser_tool.browser_type: the raw text is typed into the page, but the
         # returned display value is run through the secret-pattern redactor so API keys /
@@ -479,9 +586,7 @@ def camofox_type(ref: str, text: str, task_id: Optional[str] = None) -> str:
         display_text = (redact_tool_args_for_display("browser_type", {"text": text}) or {})["text"]
         response = {"success": True, "typed": display_text, "element": clean_ref}
         return json.dumps(redact_browser_typed_text_for_display(response, text))
-    except Exception as e:
-        from agent.display import redact_browser_typed_text_for_display
-        return tool_error(redact_browser_typed_text_for_display(str(e), text), success=False)
+    return _with_tab(task_id, "type", body)
 
 
 def camofox_scroll(direction: str, task_id: Optional[str] = None) -> str:
