@@ -675,8 +675,57 @@ def camofox_vision(question: str, annotate: bool = False, task_id: Optional[str]
 
 
 def camofox_console(clear: bool = False, task_id: Optional[str] = None) -> str:
-    """Console output is not exposed by the Camofox REST API; return an empty result with a note."""
-    return json.dumps({
-        "success": True, "console_messages": [], "js_errors": [], "total_messages": 0, "total_errors": 0,
-        "note": "Console log capture is not available with the Camofox backend. "
-                "Use browser_snapshot or browser_vision to inspect page state."})
+    """Read the tab's captured console output (console.log/warn/error/debug + uncaught
+    page exceptions) via Camofox's GET /tabs/<id>/console.
+
+    Returns the same shape the non-Camofox console path produces
+    (``console_messages`` + ``js_errors``), so callers treat the two backends
+    identically. ``clear`` maps to the server's ``consume=true`` (read-once / drain).
+    When the server predates this route (404 *route*-missing, not a dead tab) we fall
+    back to a documented "not available" note rather than failing the whole tool.
+    Dead-tab (404/410 "Tab not found") and 5xx recovery is handled by ``_with_tab``.
+    """
+    def body(session):
+        data = _get(_tab_path(session, "console"),
+                    params={**_user_params(session), **({"consume": "true"} if clear else {})})
+        raw_msgs = data.get("messages") or []
+        from agent.redact import redact_sensitive_text
+        messages = [{"type": m.get("type", "log"), "text": redact_sensitive_text(m.get("text", ""))}
+                    for m in raw_msgs if m.get("type") != "exception"]
+        js_errors = [{"message": redact_sensitive_text(m.get("text", ""))}
+                     for m in raw_msgs if m.get("type") == "exception"]
+        return json.dumps({
+            "success": True,
+            "console_messages": messages,
+            "js_errors": js_errors,
+            "total_messages": len(messages),
+            "total_errors": len(js_errors),
+            "cleared": bool(clear),
+        })
+    try:
+        return _with_tab(task_id, "read the console", body)
+    except _CamofoxGoneError as e:
+        # The server answered 404/410 and we exhausted recreating the tab. A 404 here is
+        # ambiguous (dead tab vs. server without a /console route); either way we can't
+        # return real console output, so surface an accurate note instead of a raw 404.
+        return json.dumps({
+            "success": False, "console_messages": [], "js_errors": [],
+            "total_messages": 0, "total_errors": 0,
+            "note": ("Could not read the page console: the tab is gone "
+                     f"(HTTP {e.status_code}) and could not be recreated. "
+                     "Navigate to the page again, then retry."),
+        })
+    except requests.HTTPError as e:
+        status = e.response.status_code if e.response is not None else None
+        if status in (405, 501):
+            return json.dumps({
+                "success": False, "console_messages": [], "js_errors": [],
+                "total_messages": 0, "total_errors": 0,
+                "note": ("This Camofox server has no console-capture endpoint "
+                         "(HTTP %s). JS evaluation via browser_console(expression=) "
+                         "still works; use browser_snapshot or browser_vision to "
+                         "inspect page state." % status),
+            })
+        return json.dumps({"success": False, "error": str(e),
+                           "console_messages": [], "js_errors": []})
+

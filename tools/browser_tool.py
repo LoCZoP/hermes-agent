@@ -1073,11 +1073,14 @@ def _browser_eval(expression: str, task_id: Optional[str] = None) -> str:
 
 def _camofox_eval(expression: str, task_id: Optional[str] = None) -> str:
     """Evaluate JS via Camofox's /tabs/{tab_id}/evaluate endpoint (if available)."""
-    from tools.browser_camofox import _ensure_tab, _post
+    import requests
+    from tools.browser_camofox import (
+        _CamofoxGoneError, _ensure_tab, _post, _tab_path, _user_params, _ensure_tab_with_url,
+    )
+    session = _ensure_tab(task_id or "default")
+    tab_id = session.get("tab_id") or session.get("id")
+    user_id = session["user_id"]
     try:
-        tab_info = _ensure_tab(task_id or "default")
-        tab_id = tab_info.get("tab_id") or tab_info.get("id")
-        user_id = tab_info["user_id"]
         resp = _post(f"/tabs/{tab_id}/evaluate", body={"expression": expression, "userId": user_id})
         parsed = _parse_eval_value(resp.get("result") if isinstance(resp, dict) else resp)
 
@@ -1087,10 +1090,43 @@ def _camofox_eval(expression: str, task_id: Optional[str] = None) -> str:
                 return _blocked_private_page_json(_blocked_url, _EVAL_NAVIGATED_WHY)
 
         return _dumps(_eval_ok_response(parsed), default=str)
+    except _CamofoxGoneError as e:
+        # 404/410 on evaluate means the *tab* is gone (server recycled it, page crashed,
+        # or a browser-child restart) — NOT "evaluation unsupported". The previous code
+        # matched "404" in str(gone-error) and reported "JavaScript evaluation is not
+        # supported by this Camofox server", which (a) misdiagnosed the real problem and
+        # (b) left the session wedged on a dead tab id. Recreate the tab on the last URL
+        # and retry once; if that still fails, report the actual reason.
+        logger.warning("Camofox evaluate: tab %s gone (HTTP %s); recreating and retrying.",
+                       tab_id, e.status_code)
+        last_url = session.get("last_url")
+        session["tab_id"] = None
+        try:
+            if last_url and last_url != "about:blank":
+                _ensure_tab_with_url(task_id or "default", session, last_url)
+            else:
+                _ensure_tab(task_id or "default")
+            resp = _post(_tab_path(session, "evaluate"), body={"expression": expression, "userId": user_id})
+            parsed = _parse_eval_value(resp.get("result") if isinstance(resp, dict) else resp)
+            return _dumps(_eval_ok_response(parsed), default=str)
+        except _CamofoxGoneError as e2:
+            return json.dumps(_err(f"Tab no longer valid after recreation (HTTP {e2.status_code}); navigate again."))
+        except requests.HTTPError as e2:
+            status = e2.response.status_code if e2.response is not None else None
+            if status in (405, 501):
+                return json.dumps(_err("JavaScript evaluation is not supported by this Camofox server "
+                                       "(HTTP %s). Use browser_snapshot or browser_vision to inspect page state." % status))
+            return tool_error(str(e2), success=False)
+        except Exception as e2:
+            return tool_error(str(e2), success=False)
+    except requests.HTTPError as e:
+        # A raw 405/501 (not a gone-error) genuinely means the server has no /evaluate.
+        status = e.response.status_code if e.response is not None else None
+        if status in (405, 501):
+            return json.dumps(_err("JavaScript evaluation is not supported by this Camofox server "
+                                   "(HTTP %s). Use browser_snapshot or browser_vision to inspect page state." % status))
+        return tool_error(str(e), success=False)
     except Exception as e:
-        if any(code in str(e) for code in ("404", "405", "501")):  # server without eval support
-            return json.dumps(_err("JavaScript evaluation is not supported by this Camofox server. "
-                                   "Use browser_snapshot or browser_vision to inspect page state."))
         return tool_error(str(e), success=False)
 
 
