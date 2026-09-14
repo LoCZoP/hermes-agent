@@ -2057,6 +2057,19 @@ def _iteration_summary_chat_kwargs(agent, api_messages: list) -> dict:
                 extra_body["plugins"] = [{"id": "pareto-router", "min_coding_score": _ps}]
     if extra_body:
         summary_kwargs["extra_body"] = extra_body
+    # OpenCode relay session affinity — this builder uses the agent's PRIMARY chat client
+    # directly (not the aux resolver, which already merges via _build_call_kwargs), so the
+    # main-loop header merge (build_api_kwargs) never reaches it. Without the header the
+    # relay 400s "MissingSessionID" and handle_max_iterations degrades to "couldn't summarize"
+    # instead of summarizing. Same stable key as the main turn so the summary stays on the
+    # conversation's warm backend. No-op for non-OpenCode providers.
+    from agent.opencode_affinity import merge_opencode_session_headers
+    merge_opencode_session_headers(
+        summary_kwargs,
+        getattr(agent, "provider", None),
+        getattr(agent, "base_url", None),
+        getattr(agent, "session_id", None),
+    )
     return summary_kwargs
 
 
